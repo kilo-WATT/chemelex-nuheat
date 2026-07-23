@@ -17,6 +17,7 @@ from chemelex_nuheat import (
     ScheduleMode,
     decode_temperature,
     encode_temperature,
+    parse_thermostat,
 )
 
 THERMOSTAT = {
@@ -41,10 +42,12 @@ class FakeResponse:
         payload: Any = None,
         *,
         json_error: Exception | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.status = status
         self.payload = payload
         self.json_error = json_error
+        self.headers = headers or {}
         self.released = False
 
     async def json(self) -> Any:
@@ -110,11 +113,33 @@ async def test_list_and_get_thermostats_parse_centi_celsius() -> None:
 @pytest.mark.asyncio
 async def test_get_account() -> None:
     client, _, _ = make_client(
-        FakeResponse(200, {"userName": "Owner@Example.com", "language": "en"})
+        FakeResponse(
+            200,
+            {
+                "userName": "Owner@Example.com",
+                "temperatureScale": "Celsius",
+                "language": "en",
+            },
+        )
     )
     account = await client.get_account()
     assert account.username == "Owner@Example.com"
+    assert account.temperature_scale == "Celsius"
     assert account.language == "en"
+
+
+@pytest.mark.asyncio
+async def test_nullable_account_fields() -> None:
+    client, _, _ = make_client(
+        FakeResponse(
+            200,
+            {"userName": None, "temperatureScale": None, "language": None},
+        )
+    )
+    account = await client.get_account()
+    assert account.username is None
+    assert account.temperature_scale is None
+    assert account.language is None
 
 
 @pytest.mark.asyncio
@@ -134,7 +159,6 @@ async def test_setpoint_requires_explicit_mode_and_encodes_centi_celsius() -> No
     assert session.requests[0][2]["json"] == {
         "serialNumber": "ABC123",
         "temperature": 2250,
-        "temperatureType": 0,
     }
     assert command_response.released is True
     with pytest.raises(ValueError, match="requires Hold or Manual"):
@@ -160,9 +184,41 @@ async def test_auto_and_hold_payloads() -> None:
     assert session.requests[2][2]["json"] == {
         "serialNumber": "ABC123",
         "temperature": 2400,
-        "temperatureType": 0,
         "holdUntil": "2026-07-08T01:00:00Z",
     }
+
+
+@pytest.mark.asyncio
+async def test_optional_temperature_type_uses_only_documented_enum_values() -> None:
+    client, session, _ = make_client(
+        FakeResponse(204),
+        FakeResponse(200, THERMOSTAT),
+    )
+    await client.set_schedule_mode(
+        "ABC123",
+        ScheduleMode.MANUAL,
+        temperature=22.0,
+        temperature_type=1,
+    )
+    assert session.requests[0][2]["json"]["temperatureType"] == 1
+
+    with pytest.raises(ValueError, match="0, 1, or None"):
+        await client.set_schedule_mode(
+            "ABC123",
+            ScheduleMode.MANUAL,
+            temperature_type=2,
+        )
+
+
+@pytest.mark.asyncio
+async def test_write_accepts_successful_200_before_follow_up_get() -> None:
+    command_response = FakeResponse(200, {"ignored": "write response"})
+    client, _, _ = make_client(command_response, FakeResponse(200, THERMOSTAT))
+
+    result = await client.set_schedule_mode("ABC123", ScheduleMode.AUTO)
+
+    assert result.serial_number == "ABC123"
+    assert command_response.released is True
 
 
 @pytest.mark.asyncio
@@ -185,10 +241,27 @@ async def test_rejected_authorization(statuses: tuple[int, ...]) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [429, 500, 503])
+@pytest.mark.parametrize("status", [500, 503])
 async def test_retryable_http_errors(status: int) -> None:
     client, _, _ = make_client(FakeResponse(status))
     with pytest.raises(NuHeatApiError, match=str(status)):
+        await client.list_thermostats()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_preserves_retry_after() -> None:
+    client, _, _ = make_client(FakeResponse(429, headers={"Retry-After": "58"}))
+    with pytest.raises(NuHeatApiError) as raised:
+        await client.list_thermostats()
+    assert raised.value.status == 429
+    assert raised.value.retry_after == "58"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 405, 501])
+async def test_request_or_unsupported_errors_are_data_failures(status: int) -> None:
+    client, _, _ = make_client(FakeResponse(status))
+    with pytest.raises(NuHeatDataError, match=str(status)):
         await client.list_thermostats()
 
 
@@ -216,6 +289,23 @@ async def test_invalid_thermostat_data(payload: dict[str, Any]) -> None:
     client, _, _ = make_client(FakeResponse(200, [payload]))
     with pytest.raises(NuHeatDataError):
         await client.list_thermostats()
+
+
+@pytest.mark.parametrize("mode", [1, 2, 3, 999])
+def test_mode_values_are_preserved_without_client_side_relabeling(mode: int) -> None:
+    assert parse_thermostat({**THERMOSTAT, "mode": mode}).mode == mode
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("2026-07-08T01:00:00Z", datetime(2026, 7, 8, 1, tzinfo=UTC)),
+    ],
+)
+def test_hold_expiration_parsing(value: str | None, expected: datetime | None) -> None:
+    assert parse_thermostat({**THERMOSTAT, "holdUntil": value}).hold_until == expected
 
 
 @pytest.mark.asyncio

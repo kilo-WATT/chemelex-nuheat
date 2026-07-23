@@ -19,6 +19,17 @@ API_BASE_URL: Final = "https://api.nam.mynuheat.com"
 class NuHeatApiError(RuntimeError):
     """A retryable NuHeat transport or cloud-service failure."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        retry_after: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
 
 class NuHeatAuthError(RuntimeError):
     """NuHeat rejected the current authorization."""
@@ -37,7 +48,7 @@ class ScheduleMode(StrEnum):
 
 
 class ThermostatMode(IntEnum):
-    """Mode values currently shown by the v2 OpenAPI examples."""
+    """Provisional v2 mode values awaiting live response validation."""
 
     AUTO = 1
     HOLD = 2
@@ -48,7 +59,8 @@ class ThermostatMode(IntEnum):
 class Account:
     """NuHeat account metadata available from OpenAPI v2."""
 
-    username: str
+    username: str | None
+    temperature_scale: str | None = None
     language: str | None = None
 
 
@@ -65,8 +77,6 @@ class Thermostat:
     mode: int
     hold_until: datetime | None = None
     error_state: str | None = None
-    min_temperature: float | None = None
-    max_temperature: float | None = None
 
     @property
     def room(self) -> str | None:
@@ -101,8 +111,11 @@ class NuHeatClient:
         """Return account metadata exposed by OpenAPI v2."""
         payload = await self._request_json("GET", "/api/v2/Account")
         data = _mapping(payload, "account")
-        username = _required_string(data, "userName")
-        return Account(username=username, language=_optional_string(data, "language"))
+        return Account(
+            username=_optional_string(data, "userName"),
+            temperature_scale=_optional_string(data, "temperatureScale"),
+            language=_optional_string(data, "language"),
+        )
 
     async def list_thermostats(self) -> list[Thermostat]:
         """Return all thermostats currently visible to the account."""
@@ -142,7 +155,7 @@ class NuHeatClient:
         *,
         temperature: float | None = None,
         hold_until: datetime | None = None,
-        temperature_type: int = 0,
+        temperature_type: int | None = None,
     ) -> Thermostat:
         """Send a documented Auto, Hold, or Manual mode command."""
         schedule_mode = ScheduleMode(mode)
@@ -150,7 +163,10 @@ class NuHeatClient:
         if schedule_mode is not ScheduleMode.AUTO:
             if temperature is not None:
                 payload["temperature"] = encode_temperature(temperature)
-            payload["temperatureType"] = temperature_type
+            if temperature_type is not None:
+                if isinstance(temperature_type, bool) or temperature_type not in (0, 1):
+                    raise ValueError("temperature_type must be 0, 1, or None")
+                payload["temperatureType"] = temperature_type
         if schedule_mode is ScheduleMode.HOLD and hold_until is not None:
             if hold_until.tzinfo is None:
                 raise ValueError("hold_until must be timezone-aware")
@@ -198,11 +214,27 @@ class NuHeatClient:
         if response.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
             response.release()
             raise NuHeatAuthError("NuHeat authorization was rejected")
-        if response.status == HTTPStatus.TOO_MANY_REQUESTS or response.status >= 500:
+        if response.status == HTTPStatus.TOO_MANY_REQUESTS:
+            status = response.status
+            retry_after = response.headers.get("Retry-After")
+            response.release()
+            raise NuHeatApiError(
+                f"NuHeat service temporarily failed with HTTP {status}",
+                status=status,
+                retry_after=retry_after,
+            )
+        if response.status == HTTPStatus.NOT_IMPLEMENTED:
+            response.release()
+            raise NuHeatDataError(
+                "NuHeat API rejected the request with HTTP "
+                f"{HTTPStatus.NOT_IMPLEMENTED}"
+            )
+        if response.status >= 500:
             status = response.status
             response.release()
             raise NuHeatApiError(
-                f"NuHeat service temporarily failed with HTTP {status}"
+                f"NuHeat service temporarily failed with HTTP {status}",
+                status=status,
             )
         if response.status >= HTTPStatus.BAD_REQUEST:
             status = response.status
@@ -224,8 +256,6 @@ def parse_thermostat(value: Any) -> Thermostat:
         mode=_required_int(data, "mode"),
         hold_until=_parse_datetime(data.get("holdUntil")),
         error_state=_optional_string(data, "errorState"),
-        min_temperature=_optional_temperature(data.get("minTemperature")),
-        max_temperature=_optional_temperature(data.get("maxTemperature")),
     )
 
 
@@ -246,10 +276,6 @@ def _valid_temperature(value: float) -> float:
     if not math.isfinite(value) or not -100.0 <= value <= 100.0:
         raise NuHeatDataError("NuHeat returned an invalid temperature")
     return value
-
-
-def _optional_temperature(value: Any) -> float | None:
-    return None if value is None else decode_temperature(value)
 
 
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
