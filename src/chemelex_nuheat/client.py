@@ -6,6 +6,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
 from http import HTTPStatus
 from typing import Any, Final
@@ -43,6 +44,8 @@ class ScheduleMode(StrEnum):
     """Documented OpenAPI v2 thermostat mode commands."""
 
     AUTO = "auto"
+    HOLD_UNTIL_NEXT_SCHEDULE = "hold"
+    # Compatibility alias for callers using the original command name.
     HOLD = "hold"
     MANUAL = "manual"
 
@@ -169,16 +172,18 @@ class NuHeatClient:
         temperature: float,
         *,
         mode: ScheduleMode,
+        hold_until: datetime | None = None,
     ) -> Thermostat:
         """Set a Celsius target using an explicit, caller-selected mode.
 
-        NuHeat's target-setpoint semantics remain subject to live validation,
-        so this method intentionally has no implicit Hold/Manual default.
+        Hold with an explicit end is timed. Hold without an end lasts until the
+        next scheduled event. Manual is a verified command, but its GET
+        readback remains ambiguous with Standby.
         """
         if mode is ScheduleMode.AUTO:
             raise ValueError("a target temperature requires Hold or Manual mode")
         return await self.set_schedule_mode(
-            serial_number, mode, temperature=temperature
+            serial_number, mode, temperature=temperature, hold_until=hold_until
         )
 
     async def set_schedule_mode(
@@ -190,17 +195,36 @@ class NuHeatClient:
         hold_until: datetime | None = None,
         temperature_type: int | None = None,
     ) -> Thermostat:
-        """Send a documented Auto, Hold, or Manual mode command."""
+        """Send a documented Auto, Hold, or Manual command and refresh state.
+
+        Auto resumes the schedule and is verified to exit Hold, Manual, and
+        Standby. Hold with an explicit timezone-aware ``hold_until`` is timed;
+        omitting it holds until the next scheduled event. The documented API
+        request for creating an indefinite hold remains unknown.
+
+        Manual changes the physical thermostat operating mode, although its
+        mode-3/zero-target GET response is not distinguishable from every
+        Standby response using the documented fields alone.
+        """
         schedule_mode = ScheduleMode(mode)
         payload: dict[str, Any] = {"serialNumber": _serial_value(serial_number)}
         if schedule_mode is not ScheduleMode.AUTO:
             if temperature is not None:
                 payload["temperature"] = encode_temperature(temperature)
             if temperature_type is not None:
-                if isinstance(temperature_type, bool) or temperature_type not in (0, 1):
-                    raise ValueError("temperature_type must be 0, 1, or None")
-                payload["temperatureType"] = temperature_type
-        if schedule_mode is ScheduleMode.HOLD and hold_until is not None:
+                raise ValueError(
+                    "temperature_type is not supported because its enum meanings "
+                    "are unverified"
+                )
+        if (
+            hold_until is not None
+            and schedule_mode is not ScheduleMode.HOLD_UNTIL_NEXT_SCHEDULE
+        ):
+            raise ValueError("hold_until is supported only for Hold mode")
+        if (
+            schedule_mode is ScheduleMode.HOLD_UNTIL_NEXT_SCHEDULE
+            and hold_until is not None
+        ):
             if hold_until.tzinfo is None:
                 raise ValueError("hold_until must be timezone-aware")
             payload["holdUntil"] = (
@@ -298,9 +322,10 @@ def parse_thermostat(value: Any) -> Thermostat:
 
 
 def encode_temperature(value: float) -> int:
-    """Encode Celsius as the API's integer centi-Celsius representation."""
+    """Encode Celsius as centi-Celsius using decimal half-up rounding."""
     temperature = _valid_temperature(value)
-    return round(temperature * 100)
+    centi_celsius = Decimal(str(temperature)) * 100
+    return int(centi_celsius.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def decode_temperature(value: Any) -> float | None:
@@ -353,9 +378,14 @@ def classify_thermostat_state(
 
 
 def _valid_temperature(value: float) -> float:
-    if not math.isfinite(value) or not -100.0 <= value <= 100.0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not -100.0 <= value <= 100.0
+    ):
         raise NuHeatDataError("NuHeat returned an invalid temperature")
-    return value
+    return float(value)
 
 
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:

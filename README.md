@@ -6,9 +6,9 @@ product and is not affiliated with or endorsed by Chemelex.
 
 The client targets `https://api.nam.mynuheat.com/api/v2`. Chemelex has stated
 that API v2 supports both NuHeat Signature and NuHeat Conductor thermostats.
-The read model has been validated against live Conductor responses. Live write,
-Signature, and production Home Assistant Cloud Account Linking validation are
-still pending.
+The read model and documented Auto, Hold, and Manual writes have been validated
+against live Conductor responses. Signature and production Home Assistant Cloud
+Account Linking validation are still pending.
 
 ## Installation
 
@@ -55,13 +55,15 @@ async with aiohttp.ClientSession() as session:
 - Read current temperature, target temperature, online state, heating state,
   room name, raw numeric mode, raw setpoint, hold end, and derived state.
 - Set target temperatures using Hold or Manual mode.
-- Select Auto, Hold, or Manual schedule mode.
+- Send the documented Auto, Hold, or Manual commands.
 
 Nonzero temperatures exposed by the public API are Celsius `float` values. The
 NuHeat API's centi-Celsius integers are encoded and decoded at the HTTP
 boundary. A zero or missing read value is exposed as `None`; live responses use
 zero as an unavailable setpoint sentinel. Account Fahrenheit preference does
-not change this wire decoding.
+not change this wire decoding. Outbound values use decimal half-up rounding;
+for example, 45°F converted by a caller to approximately 7.2222°C is sent as
+the integer `722`.
 
 `Thermostat.state` conservatively derives scheduled operation, timed hold,
 permanent hold, ambiguous Manual-or-Standby, or unknown from the numeric mode,
@@ -70,8 +72,25 @@ named after the Auto, Hold, and Manual write commands. The client preserves the
 raw fields so callers can handle future vendor clarifications without losing
 information.
 
-Outbound encoding and command behavior have not been changed based on the read
-observations. Live PUT validation remains pending.
+Live write validation established these command semantics:
+
+- Auto resumes the schedule and exits a hold, physical Manual mode, or Standby.
+  A GET response can remain identical before and after exiting Standby.
+- Hold with an explicit timezone-aware end creates a timed hold. The client
+  serializes the end in UTC and preserves seconds; the service may normalize
+  returned seconds to the minute.
+- Hold without an end means hold until the next scheduled event. It does not
+  create an indefinite hold. `ScheduleMode.HOLD` remains a compatibility alias
+  for `ScheduleMode.HOLD_UNTIL_NEXT_SCHEDULE`.
+- Manual selects the physical thermostat's Manual operating mode. Its
+  mode-3/zero-target GET response can still overlap Standby, so the read model
+  remains deliberately ambiguous.
+
+The documented request for creating an indefinite hold is still unknown.
+Permanent hold remains a readable state only. Successful mode writes return an
+empty HTTP 204; the client does not decode that body and follows it with a GET.
+The `temperatureType` enum meanings remain unverified, so the client omits the
+field and rejects attempts to set it.
 
 `NuHeatAuthError` indicates rejected authorization. `NuHeatApiError` indicates
 a transport, rate-limit, or server failure that may be retryable.
@@ -98,4 +117,3 @@ belong here.
 ## License
 
 Apache License 2.0.
-

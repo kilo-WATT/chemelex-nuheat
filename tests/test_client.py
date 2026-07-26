@@ -51,8 +51,10 @@ class FakeResponse:
         self.json_error = json_error
         self.headers = headers or {}
         self.released = False
+        self.json_calls = 0
 
     async def json(self) -> Any:
+        self.json_calls += 1
         if self.json_error is not None:
             raise self.json_error
         return self.payload
@@ -168,48 +170,94 @@ async def test_setpoint_requires_explicit_mode_and_encodes_centi_celsius() -> No
 
 
 @pytest.mark.asyncio
-async def test_auto_and_hold_payloads() -> None:
+@pytest.mark.parametrize(
+    ("mode", "temperature", "hold_until", "endpoint", "payload"),
+    [
+        (
+            ScheduleMode.AUTO,
+            None,
+            None,
+            "Auto",
+            {"serialNumber": "ABC123"},
+        ),
+        (
+            ScheduleMode.HOLD_UNTIL_NEXT_SCHEDULE,
+            7.2222222222,
+            datetime.fromisoformat("2026-07-25T23:11:09-04:00"),
+            "Hold",
+            {
+                "serialNumber": "ABC123",
+                "temperature": 722,
+                "holdUntil": "2026-07-26T03:11:09Z",
+            },
+        ),
+        (
+            ScheduleMode.HOLD_UNTIL_NEXT_SCHEDULE,
+            7.2222222222,
+            None,
+            "Hold",
+            {"serialNumber": "ABC123", "temperature": 722},
+        ),
+        (
+            ScheduleMode.MANUAL,
+            7.2222222222,
+            None,
+            "Manual",
+            {"serialNumber": "ABC123", "temperature": 722},
+        ),
+    ],
+)
+async def test_documented_writes_accept_empty_204_and_refresh_with_get(
+    mode: ScheduleMode,
+    temperature: float | None,
+    hold_until: datetime | None,
+    endpoint: str,
+    payload: dict[str, Any],
+) -> None:
+    """All verified mode writes accept an empty 204 before their GET refresh."""
+    command_response = FakeResponse(204, json_error=AssertionError("JSON not expected"))
     client, session, _ = make_client(
-        FakeResponse(204),
-        FakeResponse(200, {**THERMOSTAT, "mode": 1}),
-        FakeResponse(204),
+        command_response,
         FakeResponse(200, THERMOSTAT),
     )
-    await client.set_schedule_mode("ABC123", ScheduleMode.AUTO)
-    await client.set_schedule_mode(
-        "ABC123",
-        ScheduleMode.HOLD,
-        temperature=24.0,
-        hold_until=datetime(2026, 7, 8, 1, tzinfo=UTC),
+
+    result = await client.set_schedule_mode(
+        "ABC123", mode, temperature=temperature, hold_until=hold_until
     )
-    assert session.requests[0][2]["json"] == {"serialNumber": "ABC123"}
-    assert session.requests[2][2]["json"] == {
-        "serialNumber": "ABC123",
-        "temperature": 2400,
-        "holdUntil": "2026-07-08T01:00:00Z",
-    }
+
+    assert result.serial_number == "ABC123"
+    assert session.requests[0][0] == "PUT"
+    assert session.requests[0][1].endswith(f"/api/v2/Mode/{endpoint}")
+    assert session.requests[0][2]["json"] == payload
+    assert "temperatureType" not in session.requests[0][2]["json"]
+    assert session.requests[1][0] == "GET"
+    assert command_response.json_calls == 0
+    assert command_response.released is True
 
 
 @pytest.mark.asyncio
-async def test_optional_temperature_type_uses_only_documented_enum_values() -> None:
-    client, session, _ = make_client(
-        FakeResponse(204),
-        FakeResponse(200, THERMOSTAT),
-    )
-    await client.set_schedule_mode(
-        "ABC123",
-        ScheduleMode.MANUAL,
-        temperature=22.0,
-        temperature_type=1,
-    )
-    assert session.requests[0][2]["json"]["temperatureType"] == 1
+async def test_temperature_type_is_rejected_until_enum_meanings_are_verified() -> None:
+    client, session, _ = make_client()
 
-    with pytest.raises(ValueError, match="0, 1, or None"):
+    with pytest.raises(ValueError, match="enum meanings are unverified"):
+        await client.set_schedule_mode(
+            "ABC123", ScheduleMode.MANUAL, temperature=22.0, temperature_type=1
+        )
+    assert session.requests == []
+
+
+@pytest.mark.asyncio
+async def test_hold_end_is_rejected_for_non_hold_commands() -> None:
+    client, session, _ = make_client()
+
+    with pytest.raises(ValueError, match="only for Hold"):
         await client.set_schedule_mode(
             "ABC123",
             ScheduleMode.MANUAL,
-            temperature_type=2,
+            temperature=22.0,
+            hold_until=datetime(2026, 7, 8, 1, tzinfo=UTC),
         )
+    assert session.requests == []
 
 
 @pytest.mark.asyncio
@@ -221,6 +269,24 @@ async def test_write_accepts_successful_200_before_follow_up_get() -> None:
 
     assert result.serial_number == "ABC123"
     assert command_response.released is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [
+        (400, NuHeatDataError),
+        (403, NuHeatAuthError),
+        (503, NuHeatApiError),
+    ],
+)
+async def test_mode_write_non_success_still_raises_typed_error(
+    status: int, error: type[Exception]
+) -> None:
+    client, _, _ = make_client(FakeResponse(status))
+
+    with pytest.raises(error):
+        await client.set_schedule_mode("ABC123", ScheduleMode.AUTO)
 
 
 @pytest.mark.asyncio
@@ -440,12 +506,33 @@ async def test_network_failures_are_retryable(failure: Exception) -> None:
         await client.list_thermostats()
 
 
+@pytest.mark.parametrize(
+    ("value", "encoded"),
+    [
+        (7.2222222222, 722),
+        (7.2249, 722),
+        (7.225, 723),
+        (-7.225, -723),
+        (21.125, 2113),
+        (-100.0, -10000),
+        (100.0, 10000),
+    ],
+)
+def test_temperature_encoding_uses_decimal_half_up_rounding(
+    value: float, encoded: int
+) -> None:
+    assert encode_temperature(value) == encoded
+
+
 def test_temperature_codec_rejects_invalid_values() -> None:
-    assert encode_temperature(21.125) == 2112
     assert decode_temperature(2112) == 21.12
-    for value in (float("nan"), float("inf"), 101.0):
+    for value in (float("nan"), float("inf"), -100.01, 100.01, True):
         with pytest.raises(NuHeatDataError):
             encode_temperature(value)
+
+
+def test_hold_command_compatibility_alias() -> None:
+    assert ScheduleMode.HOLD is ScheduleMode.HOLD_UNTIL_NEXT_SCHEDULE
 
 
 @pytest.mark.asyncio
