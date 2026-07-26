@@ -6,8 +6,9 @@ product and is not affiliated with or endorsed by Chemelex.
 
 The client targets `https://api.nam.mynuheat.com/api/v2`. Chemelex has stated
 that API v2 supports both NuHeat Signature and NuHeat Conductor thermostats.
-Live hardware validation and production Home Assistant Cloud Account Linking
-validation are still pending.
+The read model has been validated against live Conductor responses. Live write,
+Signature, and production Home Assistant Cloud Account Linking validation are
+still pending.
 
 ## Installation
 
@@ -52,12 +53,25 @@ async with aiohttp.ClientSession() as session:
 - Retrieve account information.
 - List thermostats and retrieve one thermostat by serial number.
 - Read current temperature, target temperature, online state, heating state,
-  room name, and schedule state.
+  room name, raw numeric mode, raw setpoint, hold end, and derived state.
 - Set target temperatures using Hold or Manual mode.
 - Select Auto, Hold, or Manual schedule mode.
 
-Temperatures exposed by the public API are Celsius `float` values. The NuHeat
-API's centi-Celsius integers are encoded and decoded at the HTTP boundary.
+Nonzero temperatures exposed by the public API are Celsius `float` values. The
+NuHeat API's centi-Celsius integers are encoded and decoded at the HTTP
+boundary. A zero or missing read value is exposed as `None`; live responses use
+zero as an unavailable setpoint sentinel. Account Fahrenheit preference does
+not change this wire decoding.
+
+`Thermostat.state` conservatively derives scheduled operation, timed hold,
+permanent hold, ambiguous Manual-or-Standby, or unknown from the numeric mode,
+raw setpoint, and hold end together. Numeric read modes are deliberately not
+named after the Auto, Hold, and Manual write commands. The client preserves the
+raw fields so callers can handle future vendor clarifications without losing
+information.
+
+Outbound encoding and command behavior have not been changed based on the read
+observations. Live PUT validation remains pending.
 
 `NuHeatAuthError` indicates rejected authorization. `NuHeatApiError` indicates
 a transport, rate-limit, or server failure that may be retryable.

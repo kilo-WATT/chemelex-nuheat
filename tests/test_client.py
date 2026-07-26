@@ -10,11 +10,13 @@ import pytest
 from aiohttp import ClientConnectionError
 
 from chemelex_nuheat import (
+    HoldUntilStatus,
     NuHeatApiError,
     NuHeatAuthError,
     NuHeatClient,
     NuHeatDataError,
     ScheduleMode,
+    ThermostatState,
     decode_temperature,
     encode_temperature,
     parse_thermostat,
@@ -294,6 +296,128 @@ async def test_invalid_thermostat_data(payload: dict[str, Any]) -> None:
 @pytest.mark.parametrize("mode", [1, 2, 3, 999])
 def test_mode_values_are_preserved_without_client_side_relabeling(mode: int) -> None:
     assert parse_thermostat({**THERMOSTAT, "mode": mode}).mode == mode
+
+
+@pytest.mark.parametrize(
+    ("mode", "hold_until", "raw_target", "expected"),
+    [
+        (2, None, 0, ThermostatState.SCHEDULED),
+        (
+            2,
+            "2026-07-08T01:00:00Z",
+            740,
+            ThermostatState.TIMED_HOLD,
+        ),
+        (3, None, 740, ThermostatState.PERMANENT_HOLD),
+        (3, None, 0, ThermostatState.AMBIGUOUS_MANUAL_OR_STANDBY),
+        (999, None, 0, ThermostatState.UNKNOWN),
+        (2, None, 740, ThermostatState.UNKNOWN),
+        (2, "2026-07-08T01:00:00Z", 0, ThermostatState.UNKNOWN),
+        (3, "2026-07-08T01:00:00Z", 740, ThermostatState.UNKNOWN),
+    ],
+)
+def test_live_validated_state_classification(
+    mode: int,
+    hold_until: str | None,
+    raw_target: int,
+    expected: ThermostatState,
+) -> None:
+    thermostat = parse_thermostat(
+        {
+            **THERMOSTAT,
+            "mode": mode,
+            "holdUntil": hold_until,
+            "setPointTemperature": raw_target,
+        }
+    )
+
+    assert thermostat.numeric_mode == mode
+    assert thermostat.raw_target_temperature == raw_target
+    assert thermostat.state is expected
+
+
+@pytest.mark.parametrize(
+    ("hold_until", "expected_status"),
+    [
+        ("not-a-timestamp", HoldUntilStatus.INVALID),
+        ("2026-07-08T01:00:00", HoldUntilStatus.INVALID),
+        ("", HoldUntilStatus.INVALID),
+        (42, HoldUntilStatus.INVALID),
+    ],
+)
+def test_malformed_hold_until_is_unknown_without_crashing(
+    hold_until: object, expected_status: HoldUntilStatus
+) -> None:
+    thermostat = parse_thermostat(
+        {**THERMOSTAT, "holdUntil": hold_until, "setPointTemperature": 740}
+    )
+
+    assert thermostat.hold_until is None
+    assert thermostat.hold_until_status is expected_status
+    assert thermostat.state is ThermostatState.UNKNOWN
+
+
+def test_missing_hold_until_is_unknown_without_crashing() -> None:
+    payload = dict(THERMOSTAT)
+    payload.pop("holdUntil")
+
+    thermostat = parse_thermostat(payload)
+
+    assert thermostat.hold_until is None
+    assert thermostat.hold_until_status is HoldUntilStatus.MISSING
+    assert thermostat.state is ThermostatState.UNKNOWN
+
+
+def test_zero_and_missing_target_are_unavailable() -> None:
+    zero = parse_thermostat(
+        {**THERMOSTAT, "mode": 2, "holdUntil": None, "setPointTemperature": 0}
+    )
+    missing_payload = dict(THERMOSTAT)
+    missing_payload.pop("setPointTemperature")
+    missing = parse_thermostat(missing_payload)
+
+    assert decode_temperature(0) is None
+    assert decode_temperature(None) is None
+    assert zero.target_temperature is None
+    assert zero.raw_target_temperature == 0
+    assert zero.state is ThermostatState.SCHEDULED
+    assert missing.target_temperature is None
+    assert missing.raw_target_temperature is None
+    assert missing.state is ThermostatState.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_fahrenheit_account_does_not_change_wire_decoding() -> None:
+    client, _, _ = make_client(
+        FakeResponse(
+            200,
+            {
+                "userName": "synthetic@example.invalid",
+                "temperatureScale": "Fahrenheit",
+                "language": "en",
+            },
+        ),
+        FakeResponse(200, {**THERMOSTAT, "setPointTemperature": 740}),
+    )
+
+    account = await client.get_account()
+    thermostat = await client.get_thermostat("ABC123")
+
+    assert account.temperature_scale == "Fahrenheit"
+    assert thermostat.target_temperature == 7.4
+
+
+def test_centi_celsius_precision_can_share_one_fahrenheit_display_degree() -> None:
+    celsius_values = [decode_temperature(raw) for raw in (722, 726, 737, 740)]
+
+    assert all(value is not None for value in celsius_values)
+    assert {round(value * 9 / 5 + 32) for value in celsius_values if value} == {45}
+    assert len(set(celsius_values)) == 4
+
+
+@pytest.mark.parametrize("heating", [True, False])
+def test_heating_flag_is_preserved(heating: bool) -> None:
+    assert parse_thermostat({**THERMOSTAT, "isHeating": heating}).heating is heating
 
 
 @pytest.mark.parametrize(

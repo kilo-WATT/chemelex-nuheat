@@ -6,7 +6,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import IntEnum, StrEnum
+from enum import StrEnum
 from http import HTTPStatus
 from typing import Any, Final
 from urllib.parse import quote
@@ -47,12 +47,27 @@ class ScheduleMode(StrEnum):
     MANUAL = "manual"
 
 
-class ThermostatMode(IntEnum):
-    """Provisional v2 mode values awaiting live response validation."""
+class ThermostatState(StrEnum):
+    """State derived from the complete live-validated thermostat response."""
 
-    AUTO = 1
-    HOLD = 2
-    MANUAL = 3
+    SCHEDULED = "scheduled"
+    TIMED_HOLD = "timed_hold"
+    PERMANENT_HOLD = "permanent_hold"
+    AMBIGUOUS_MANUAL_OR_STANDBY = "ambiguous_manual_or_standby"
+    UNKNOWN = "unknown"
+
+
+class HoldUntilStatus(StrEnum):
+    """Shape of the raw ``holdUntil`` response field."""
+
+    MISSING = "missing"
+    NULL = "null"
+    VALUE = "value"
+    INVALID = "invalid"
+
+
+MODE_SCHEDULE_OR_TIMED_HOLD: Final = 2
+MODE_PERMANENT_HOLD_OR_MANUAL: Final = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,18 +85,36 @@ class Thermostat:
 
     serial_number: str
     name: str | None
-    current_temperature: float
-    target_temperature: float
+    current_temperature: float | None
+    target_temperature: float | None
     heating: bool
     online: bool
     mode: int
+    raw_target_temperature: int | float | None = None
     hold_until: datetime | None = None
+    raw_hold_until: str | None = None
+    hold_until_status: HoldUntilStatus = HoldUntilStatus.NULL
     error_state: str | None = None
 
     @property
     def room(self) -> str | None:
         """Return the thermostat room/name alias."""
         return self.name
+
+    @property
+    def numeric_mode(self) -> int:
+        """Return the unmodified numeric mode from the API."""
+        return self.mode
+
+    @property
+    def state(self) -> ThermostatState:
+        """Return a conservative state derived from all relevant raw fields."""
+        return classify_thermostat_state(
+            self.mode,
+            self.raw_target_temperature,
+            self.hold_until,
+            self.hold_until_status,
+        )
 
 
 AccessTokenProvider = Callable[[bool], Awaitable[str]]
@@ -246,15 +279,20 @@ class NuHeatClient:
 def parse_thermostat(value: Any) -> Thermostat:
     """Parse one documented thermostat object into the public model."""
     data = _mapping(value, "thermostat")
+    raw_target = _optional_wire_temperature(data.get("setPointTemperature"))
+    hold_until, raw_hold_until, hold_until_status = _parse_hold_until(data)
     return Thermostat(
         serial_number=_required_string(data, "serialNumber"),
         name=_optional_string(data, "name"),
         current_temperature=decode_temperature(data.get("currentTemperature")),
-        target_temperature=decode_temperature(data.get("setPointTemperature")),
+        target_temperature=decode_temperature(raw_target),
         heating=_required_bool(data, "isHeating"),
         online=_required_bool(data, "online"),
         mode=_required_int(data, "mode"),
-        hold_until=_parse_datetime(data.get("holdUntil")),
+        raw_target_temperature=raw_target,
+        hold_until=hold_until,
+        raw_hold_until=raw_hold_until,
+        hold_until_status=hold_until_status,
         error_state=_optional_string(data, "errorState"),
     )
 
@@ -265,11 +303,53 @@ def encode_temperature(value: float) -> int:
     return round(temperature * 100)
 
 
-def decode_temperature(value: Any) -> float:
-    """Decode the API's integer centi-Celsius representation."""
+def decode_temperature(value: Any) -> float | None:
+    """Decode centi-Celsius, treating zero or a missing value as unavailable."""
+    if value is None:
+        return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise NuHeatDataError("NuHeat returned an invalid temperature")
+    if value == 0:
+        return None
     return _valid_temperature(float(value) / 100.0)
+
+
+def classify_thermostat_state(
+    mode: Any,
+    raw_target_temperature: Any,
+    hold_until: datetime | None,
+    hold_until_status: HoldUntilStatus,
+) -> ThermostatState:
+    """Classify a response without equating numeric modes to write commands."""
+    if isinstance(mode, bool) or not isinstance(mode, int):
+        return ThermostatState.UNKNOWN
+    if hold_until_status is HoldUntilStatus.VALUE:
+        if hold_until is None:
+            return ThermostatState.UNKNOWN
+    elif hold_until_status is HoldUntilStatus.NULL:
+        if hold_until is not None:
+            return ThermostatState.UNKNOWN
+    else:
+        return ThermostatState.UNKNOWN
+
+    zero_target = (
+        not isinstance(raw_target_temperature, bool)
+        and isinstance(raw_target_temperature, (int, float))
+        and raw_target_temperature == 0
+    )
+    valid_target = _is_valid_nonzero_wire_temperature(raw_target_temperature)
+
+    if mode == MODE_SCHEDULE_OR_TIMED_HOLD:
+        if hold_until_status is HoldUntilStatus.NULL and zero_target:
+            return ThermostatState.SCHEDULED
+        if hold_until_status is HoldUntilStatus.VALUE and valid_target:
+            return ThermostatState.TIMED_HOLD
+    elif mode == MODE_PERMANENT_HOLD_OR_MANUAL:
+        if hold_until_status is HoldUntilStatus.NULL and valid_target:
+            return ThermostatState.PERMANENT_HOLD
+        if hold_until_status is HoldUntilStatus.NULL and zero_target:
+            return ThermostatState.AMBIGUOUS_MANUAL_OR_STANDBY
+    return ThermostatState.UNKNOWN
 
 
 def _valid_temperature(value: float) -> float:
@@ -314,18 +394,52 @@ def _required_int(data: Mapping[str, Any], key: str) -> int:
     return value
 
 
-def _parse_datetime(value: Any) -> datetime | None:
-    if value is None or value == "":
+def _optional_wire_temperature(value: Any) -> int | float | None:
+    if value is None:
         return None
-    if not isinstance(value, str):
-        raise NuHeatDataError("NuHeat returned an invalid hold timestamp")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise NuHeatDataError("NuHeat returned an invalid temperature")
+    decoded = decode_temperature(value)
+    if value != 0 and decoded is None:  # pragma: no cover - defensive narrowing
+        raise NuHeatDataError("NuHeat returned an invalid temperature")
+    return value
+
+
+def _is_valid_nonzero_wire_temperature(value: Any) -> bool:
+    if (
+        value is None
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value == 0
+    ):
+        return False
+    try:
+        return decode_temperature(value) is not None
+    except NuHeatDataError:
+        return False
+
+
+def _parse_hold_until(
+    data: Mapping[str, Any],
+) -> tuple[datetime | None, str | None, HoldUntilStatus]:
+    if "holdUntil" not in data:
+        return None, None, HoldUntilStatus.MISSING
+    value = data["holdUntil"]
+    if value is None:
+        return None, None, HoldUntilStatus.NULL
+    if not isinstance(value, str) or not value:
+        return (
+            None,
+            value if isinstance(value, str) else None,
+            HoldUntilStatus.INVALID,
+        )
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as err:
-        raise NuHeatDataError("NuHeat returned an invalid hold timestamp") from err
+    except ValueError:
+        return None, value, HoldUntilStatus.INVALID
     if parsed.tzinfo is None:
-        raise NuHeatDataError("NuHeat returned an invalid hold timestamp")
-    return parsed
+        return None, value, HoldUntilStatus.INVALID
+    return parsed, value, HoldUntilStatus.VALUE
 
 
 def _serial_value(value: str) -> str:
