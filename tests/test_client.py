@@ -5,11 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from aiohttp import ClientConnectionError
 
 from chemelex_nuheat import (
+    STANDBY_TEMPERATURE_C,
     HoldUntilStatus,
     NuHeatApiError,
     NuHeatAuthError,
@@ -167,6 +169,36 @@ async def test_setpoint_requires_explicit_mode_and_encodes_centi_celsius() -> No
     assert command_response.released is True
     with pytest.raises(ValueError, match="requires Hold or Manual"):
         await client.set_target_temperature("ABC123", 22.5, mode=ScheduleMode.AUTO)
+
+
+@pytest.mark.asyncio
+async def test_standby_uses_manual_at_5c_and_refreshes_with_get() -> None:
+    """Standby reuses the verified Manual write and centralized encoder."""
+    command_response = FakeResponse(204, json_error=AssertionError("JSON not expected"))
+    client, session, _ = make_client(
+        command_response,
+        FakeResponse(200, THERMOSTAT),
+    )
+
+    with patch(
+        "chemelex_nuheat.client.encode_temperature", wraps=encode_temperature
+    ) as encoder:
+        result = await client.set_standby("ABC123")
+
+    encoder.assert_called_once_with(STANDBY_TEMPERATURE_C)
+    assert STANDBY_TEMPERATURE_C == 5.0
+    assert result.serial_number == "ABC123"
+    assert session.requests[0][0] == "PUT"
+    assert session.requests[0][1].endswith("/api/v2/Mode/Manual")
+    assert session.requests[0][2]["json"] == {
+        "serialNumber": "ABC123",
+        "temperature": 500,
+    }
+    assert "temperatureType" not in session.requests[0][2]["json"]
+    assert "holdUntil" not in session.requests[0][2]["json"]
+    assert session.requests[1][0] == "GET"
+    assert command_response.json_calls == 0
+    assert command_response.released is True
 
 
 @pytest.mark.asyncio
@@ -400,6 +432,31 @@ def test_live_validated_state_classification(
     assert thermostat.numeric_mode == mode
     assert thermostat.raw_target_temperature == raw_target
     assert thermostat.state is expected
+
+
+@pytest.mark.parametrize(
+    ("mode", "raw_target", "expected"),
+    [
+        (2, 0, ThermostatState.SCHEDULED),
+        (3, 0, ThermostatState.AMBIGUOUS_MANUAL_OR_STANDBY),
+        (3, 718, ThermostatState.PERMANENT_HOLD),
+    ],
+)
+def test_get_contract_never_infers_standby(
+    mode: int, raw_target: int, expected: ThermostatState
+) -> None:
+    """Overlapping GET shapes retain existing honest classifications."""
+    thermostat = parse_thermostat(
+        {
+            **THERMOSTAT,
+            "mode": mode,
+            "holdUntil": None,
+            "setPointTemperature": raw_target,
+        }
+    )
+
+    assert thermostat.state is expected
+    assert "standby" not in {state.value for state in ThermostatState}
 
 
 @pytest.mark.parametrize(

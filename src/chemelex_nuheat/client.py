@@ -15,6 +15,8 @@ from urllib.parse import quote
 from aiohttp import ClientError, ClientResponse, ClientSession, ContentTypeError
 
 API_BASE_URL: Final = "https://api.nam.mynuheat.com"
+# NuHeat's official app Standby is implemented as physical Manual at 41°F.
+STANDBY_TEMPERATURE_C: Final = 5.0
 
 
 class NuHeatApiError(RuntimeError):
@@ -184,6 +186,18 @@ class NuHeatClient:
             raise ValueError("a target temperature requires Hold or Manual mode")
         return await self.set_schedule_mode(
             serial_number, mode, temperature=temperature, hold_until=hold_until
+        )
+
+    async def set_standby(self, serial_number: str) -> Thermostat:
+        """Command app Standby, implemented by the thermostat as Manual at 5°C.
+
+        Standby is a verified command outcome, but documented GET fields cannot
+        distinguish it reliably from scheduled, held, or Manual operation.
+        """
+        return await self.set_schedule_mode(
+            serial_number,
+            ScheduleMode.MANUAL,
+            temperature=STANDBY_TEMPERATURE_C,
         )
 
     async def set_schedule_mode(

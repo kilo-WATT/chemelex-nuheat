@@ -2,6 +2,7 @@
 
 from .client import (
     API_BASE_URL,
+    STANDBY_TEMPERATURE_C,
     AccessTokenProvider,
     Account,
     HoldUntilStatus,
@@ -28,6 +29,7 @@ __all__ = [
     "NuHeatClient",
     "NuHeatDataError",
     "ScheduleMode",
+    "STANDBY_TEMPERATURE_C",
     "Thermostat",
     "ThermostatState",
     "classify_thermostat_state",

@@ -46,6 +46,7 @@ async with aiohttp.ClientSession() as session:
         22.5,
         mode=ScheduleMode.MANUAL,
     )
+    await client.set_standby(thermostat.serial_number)
 ```
 
 ## Supported operations
@@ -56,6 +57,7 @@ async with aiohttp.ClientSession() as session:
   room name, raw numeric mode, raw setpoint, hold end, and derived state.
 - Set target temperatures using Hold or Manual mode.
 - Send the documented Auto, Hold, or Manual commands.
+- Command the official app's Standby state.
 
 Nonzero temperatures exposed by the public API are Celsius `float` values. The
 NuHeat API's centi-Celsius integers are encoded and decoded at the HTTP
@@ -76,6 +78,9 @@ Live write validation established these command semantics:
 
 - Auto resumes the schedule and exits a hold, physical Manual mode, or Standby.
   A GET response can remain identical before and after exiting Standby.
+- Standby uses the documented Manual command at 5°C/41°F. The official app
+  labels this state Standby while the physical thermostat reports Manual at
+  41°F. It is a frost-protected standby state, not a hard power disconnect.
 - Hold with an explicit timezone-aware end creates a timed hold. The client
   serializes the end in UTC and preserves seconds; the service may normalize
   returned seconds to the minute.
@@ -85,6 +90,10 @@ Live write validation established these command semantics:
 - Manual selects the physical thermostat's Manual operating mode. Its
   mode-3/zero-target GET response can still overlap Standby, so the read model
   remains deliberately ambiguous.
+
+Standby is a verified command outcome but cannot be inferred reliably from the
+documented GET fields. Identical GET responses can represent Standby or another
+visible state, so the library deliberately exposes no derived Standby state.
 
 The documented request for creating an indefinite hold is still unknown.
 Permanent hold remains a readable state only. Successful mode writes return an
