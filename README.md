@@ -10,6 +10,14 @@ The read model and documented Auto, Hold, and Manual writes have been validated
 against live Conductor responses. Signature and production Home Assistant Cloud
 Account Linking validation are still pending.
 
+## Maintenance status
+
+This package is being published by `kilo-WATT` on an interim basis to help
+restore the Home Assistant NuHeat integration. The current publisher does not
+intend to be the long-term owner or maintainer. An established maintainer or
+organization willing to take responsibility for the repository and PyPI
+releases is actively sought.
+
 ## Installation
 
 ```console
