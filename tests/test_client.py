@@ -399,17 +399,18 @@ def test_mode_values_are_preserved_without_client_side_relabeling(mode: int) -> 
 @pytest.mark.parametrize(
     ("mode", "hold_until", "raw_target", "expected"),
     [
-        (2, None, 0, ThermostatState.SCHEDULED),
+        (1, None, 500, ThermostatState.SCHEDULED),
+        (2, None, 2370, ThermostatState.TIMED_HOLD),
         (
             2,
             "2026-07-08T01:00:00Z",
             740,
             ThermostatState.TIMED_HOLD,
         ),
-        (3, None, 740, ThermostatState.PERMANENT_HOLD),
-        (3, None, 0, ThermostatState.AMBIGUOUS_MANUAL_OR_STANDBY),
+        (3, None, 500, ThermostatState.STANDBY),
+        (3, None, 2111, ThermostatState.AMBIGUOUS_MANUAL_OR_PERMANENT_HOLD),
         (999, None, 0, ThermostatState.UNKNOWN),
-        (2, None, 740, ThermostatState.UNKNOWN),
+        (1, None, 0, ThermostatState.UNKNOWN),
         (2, "2026-07-08T01:00:00Z", 0, ThermostatState.UNKNOWN),
         (3, "2026-07-08T01:00:00Z", 740, ThermostatState.UNKNOWN),
     ],
@@ -437,15 +438,16 @@ def test_live_validated_state_classification(
 @pytest.mark.parametrize(
     ("mode", "raw_target", "expected"),
     [
-        (2, 0, ThermostatState.SCHEDULED),
-        (3, 0, ThermostatState.AMBIGUOUS_MANUAL_OR_STANDBY),
-        (3, 718, ThermostatState.PERMANENT_HOLD),
+        (1, 500, ThermostatState.SCHEDULED),
+        (2, 2370, ThermostatState.TIMED_HOLD),
+        (3, 500, ThermostatState.STANDBY),
+        (3, 2111, ThermostatState.AMBIGUOUS_MANUAL_OR_PERMANENT_HOLD),
     ],
 )
-def test_get_contract_never_infers_standby(
+def test_corrected_get_contract_classification(
     mode: int, raw_target: int, expected: ThermostatState
 ) -> None:
-    """Overlapping GET shapes retain existing honest classifications."""
+    """Mode plus target reproduces the controlled live state matrix."""
     thermostat = parse_thermostat(
         {
             **THERMOSTAT,
@@ -456,7 +458,18 @@ def test_get_contract_never_infers_standby(
     )
 
     assert thermostat.state is expected
-    assert "standby" not in {state.value for state in ThermostatState}
+
+
+def test_standby_and_auto_at_41f_are_distinct() -> None:
+    standby = parse_thermostat(
+        {**THERMOSTAT, "mode": 3, "holdUntil": None, "setPointTemperature": 500}
+    )
+    scheduled = parse_thermostat(
+        {**THERMOSTAT, "mode": 1, "holdUntil": None, "setPointTemperature": 500}
+    )
+
+    assert standby.state is ThermostatState.STANDBY
+    assert scheduled.state is ThermostatState.SCHEDULED
 
 
 @pytest.mark.parametrize(
@@ -493,7 +506,7 @@ def test_missing_hold_until_is_unknown_without_crashing() -> None:
 
 def test_zero_and_missing_target_are_unavailable() -> None:
     zero = parse_thermostat(
-        {**THERMOSTAT, "mode": 2, "holdUntil": None, "setPointTemperature": 0}
+        {**THERMOSTAT, "mode": 1, "holdUntil": None, "setPointTemperature": 0}
     )
     missing_payload = dict(THERMOSTAT)
     missing_payload.pop("setPointTemperature")
@@ -503,7 +516,7 @@ def test_zero_and_missing_target_are_unavailable() -> None:
     assert decode_temperature(None) is None
     assert zero.target_temperature is None
     assert zero.raw_target_temperature == 0
-    assert zero.state is ThermostatState.SCHEDULED
+    assert zero.state is ThermostatState.UNKNOWN
     assert missing.target_temperature is None
     assert missing.raw_target_temperature is None
     assert missing.state is ThermostatState.UNKNOWN

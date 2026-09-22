@@ -57,8 +57,8 @@ class ThermostatState(StrEnum):
 
     SCHEDULED = "scheduled"
     TIMED_HOLD = "timed_hold"
-    PERMANENT_HOLD = "permanent_hold"
-    AMBIGUOUS_MANUAL_OR_STANDBY = "ambiguous_manual_or_standby"
+    STANDBY = "standby"
+    AMBIGUOUS_MANUAL_OR_PERMANENT_HOLD = "ambiguous_manual_or_permanent_hold"
     UNKNOWN = "unknown"
 
 
@@ -71,8 +71,10 @@ class HoldUntilStatus(StrEnum):
     INVALID = "invalid"
 
 
-MODE_SCHEDULE_OR_TIMED_HOLD: Final = 2
-MODE_PERMANENT_HOLD_OR_MANUAL: Final = 3
+MODE_AUTO: Final = 1
+MODE_HOLD: Final = 2
+MODE_MANUAL: Final = 3
+STANDBY_RAW_TEMPERATURE: Final = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +361,7 @@ def classify_thermostat_state(
     hold_until: datetime | None,
     hold_until_status: HoldUntilStatus,
 ) -> ThermostatState:
-    """Classify a response without equating numeric modes to write commands."""
+    """Classify a response using the corrected, live-validated GET contract."""
     if isinstance(mode, bool) or not isinstance(mode, int):
         return ThermostatState.UNKNOWN
     if hold_until_status is HoldUntilStatus.VALUE:
@@ -371,23 +373,19 @@ def classify_thermostat_state(
     else:
         return ThermostatState.UNKNOWN
 
-    zero_target = (
-        not isinstance(raw_target_temperature, bool)
-        and isinstance(raw_target_temperature, (int, float))
-        and raw_target_temperature == 0
-    )
     valid_target = _is_valid_nonzero_wire_temperature(raw_target_temperature)
 
-    if mode == MODE_SCHEDULE_OR_TIMED_HOLD:
-        if hold_until_status is HoldUntilStatus.NULL and zero_target:
-            return ThermostatState.SCHEDULED
-        if hold_until_status is HoldUntilStatus.VALUE and valid_target:
-            return ThermostatState.TIMED_HOLD
-    elif mode == MODE_PERMANENT_HOLD_OR_MANUAL:
+    if mode == MODE_AUTO:
         if hold_until_status is HoldUntilStatus.NULL and valid_target:
-            return ThermostatState.PERMANENT_HOLD
-        if hold_until_status is HoldUntilStatus.NULL and zero_target:
-            return ThermostatState.AMBIGUOUS_MANUAL_OR_STANDBY
+            return ThermostatState.SCHEDULED
+    elif mode == MODE_HOLD:
+        if valid_target:
+            return ThermostatState.TIMED_HOLD
+    elif mode == MODE_MANUAL and hold_until_status is HoldUntilStatus.NULL:
+        if raw_target_temperature == STANDBY_RAW_TEMPERATURE:
+            return ThermostatState.STANDBY
+        if valid_target:
+            return ThermostatState.AMBIGUOUS_MANUAL_OR_PERMANENT_HOLD
     return ThermostatState.UNKNOWN
 
 

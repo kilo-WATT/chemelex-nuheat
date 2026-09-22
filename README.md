@@ -76,10 +76,13 @@ for example, 45°F converted by a caller to approximately 7.2222°C is sent as
 the integer `722`.
 
 `Thermostat.state` conservatively derives scheduled operation, timed hold,
-permanent hold, ambiguous Manual-or-Standby, or unknown from the numeric mode,
-raw setpoint, and hold end together. Numeric read modes are deliberately not
-named after the Auto, Hold, and Manual write commands. The client preserves the
-raw fields so callers can handle future vendor clarifications without losing
+Standby, ambiguous Manual-or-permanent-hold, or unknown from the numeric mode,
+raw setpoint, and hold end together. Controlled live validation after the
+vendor's September 2026 GET fix established mode 1 as Auto, mode 2 as Hold,
+and mode 3 as the Manual-family response. Mode 3 with a 5°C target is the
+official app's Standby state. Other mode-3 targets remain ambiguous between
+physical Manual and an indefinite hold in v2. The client preserves all raw
+fields so callers can handle future vendor clarifications without losing
 information.
 
 Live write validation established these command semantics:
@@ -95,17 +98,17 @@ Live write validation established these command semantics:
 - Hold without an end means hold until the next scheduled event. It does not
   create an indefinite hold. `ScheduleMode.HOLD` remains a compatibility alias
   for `ScheduleMode.HOLD_UNTIL_NEXT_SCHEDULE`.
-- Manual selects the physical thermostat's Manual operating mode. Its
-  mode-3/zero-target GET response can still overlap Standby, so the read model
-  remains deliberately ambiguous.
+- Manual selects the physical thermostat's Manual operating mode. Non-Standby
+  mode-3 targets still overlap an Auto operating mode with indefinite hold in
+  the v2 read model, so that state remains deliberately ambiguous.
 
-Standby is a verified command outcome but cannot be inferred reliably from the
-documented GET fields. Identical GET responses can represent Standby or another
-visible state, so the library deliberately exposes no derived Standby state.
+Standby is both writable and readable: mode 3 with raw target `500` represents
+5°C/41°F Standby. Auto at the same 41°F target remains distinguishable because
+it reports mode 1.
 
 The documented request for creating an indefinite hold is still unknown.
-Permanent hold remains a readable state only. Successful mode writes return an
-empty HTTP 204; the client does not decode that body and follows it with a GET.
+Successful mode writes return an empty HTTP 204; the client does not decode
+that body and follows it with a GET.
 The `temperatureType` enum meanings remain unverified, so the client omits the
 field and rejects attempts to set it.
 
