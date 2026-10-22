@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 (unreleased)
+
+* Add an explicit, live-verified v1 Permanent Hold command with mandatory target.
+* Optionally correlate v1 operating/schedule details with mode-3 v2 responses,
+  distinguishing physical Manual from Auto with Permanent Hold.
+* Preserve v2-only default behavior, authenticated request handling and identifiers.
+
 ## 0.1.1 - 2026-09-21
 
 - Align derived thermostat states with corrected live OpenAPI v2 GET responses.

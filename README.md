@@ -106,7 +106,8 @@ Standby is both writable and readable: mode 3 with raw target `500` represents
 5°C/41°F Standby. Auto at the same 41°F target remains distinguishable because
 it reports mode 1.
 
-The documented request for creating an indefinite hold is still unknown.
+The optional 0.1.2 extension creates indefinite hold using the documented v1
+thermostat command; v2 has no separate Permanent Hold command endpoint.
 Successful mode writes return an empty HTTP 204; the client does not decode
 that body and follows it with a GET.
 The `temperatureType` enum meanings remain unverified, so the client omits the
@@ -137,3 +138,19 @@ belong here.
 ## License
 
 Apache License 2.0.
+
+## Unreleased 0.1.2 Permanent Hold extension
+
+`NuHeatClient(..., include_schedule_details=True)` supplements mode-3 reads with
+correlated v1 operating/schedule fields. Matching Auto/schedule-mode-3 responses
+report `ThermostatState.PERMANENT_HOLD`; physical Manual reports `MANUAL`.
+Other callers keep the existing v2-only behavior by default. Missing/conflicting
+metadata retains the conservative v2 state, never a guessed Permanent Hold.
+
+`set_schedule_mode(serial, ScheduleMode.PERMANENT_HOLD, temperature=celsius)` uses
+the documented minimal v1 thermostat update. Temperature is mandatory; expiration
+and temperatureType are rejected. `set_target_temperature` accepts the same mode.
+The command was verified from Manual and scheduled Auto in an approved isolated
+hardware comparison, with the original state restored. This version is not yet
+published. Older notes about an unknown indefinite-hold request describe v2-only
+behavior and are superseded by this explicit v1 command.

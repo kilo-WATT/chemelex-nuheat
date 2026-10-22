@@ -1,10 +1,10 @@
-"""Async client for the documented Chemelex NuHeat OpenAPI v2."""
+"""Async client for the documented Chemelex NuHeat OpenAPI."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
@@ -50,6 +50,7 @@ class ScheduleMode(StrEnum):
     # Compatibility alias for callers using the original command name.
     HOLD = "hold"
     MANUAL = "manual"
+    PERMANENT_HOLD = "permanent_hold"
 
 
 class ThermostatState(StrEnum):
@@ -58,6 +59,8 @@ class ThermostatState(StrEnum):
     SCHEDULED = "scheduled"
     TIMED_HOLD = "timed_hold"
     STANDBY = "standby"
+    MANUAL = "manual"
+    PERMANENT_HOLD = "permanent_hold"
     AMBIGUOUS_MANUAL_OR_PERMANENT_HOLD = "ambiguous_manual_or_permanent_hold"
     UNKNOWN = "unknown"
 
@@ -102,6 +105,9 @@ class Thermostat:
     raw_hold_until: str | None = None
     hold_until_status: HoldUntilStatus = HoldUntilStatus.NULL
     error_state: str | None = None
+    operating_mode: int | None = None
+    schedule_mode: int | None = None
+    schedule_details_requested: bool = False
 
     @property
     def room(self) -> str | None:
@@ -116,6 +122,24 @@ class Thermostat:
     @property
     def state(self) -> ThermostatState:
         """Return a conservative state derived from all relevant raw fields."""
+        if (
+            self.mode == MODE_MANUAL
+            and self.hold_until_status is HoldUntilStatus.NULL
+            and self.hold_until is None
+            and _is_valid_nonzero_wire_temperature(self.raw_target_temperature)
+        ):
+            if self.schedule_mode == 3:
+                if self.operating_mode == 1:
+                    return ThermostatState.PERMANENT_HOLD
+                if self.operating_mode == 2:
+                    return (
+                        ThermostatState.STANDBY
+                        if self.raw_target_temperature == STANDBY_RAW_TEMPERATURE
+                        else ThermostatState.MANUAL
+                    )
+            if self.schedule_details_requested:
+                # 5 C can also be a legitimate Auto-family permanent target.
+                return ThermostatState.AMBIGUOUS_MANUAL_OR_PERMANENT_HOLD
         return classify_thermostat_state(
             self.mode,
             self.raw_target_temperature,
@@ -142,10 +166,12 @@ class NuHeatClient:
         access_token_provider: AccessTokenProvider,
         *,
         base_url: str = API_BASE_URL,
+        include_schedule_details: bool = False,
     ) -> None:
         self._session = session
         self._access_token_provider = access_token_provider
         self._base_url = base_url.rstrip("/")
+        self._include_schedule_details = include_schedule_details
 
     async def get_account(self) -> Account:
         """Return account metadata exposed by OpenAPI v2."""
@@ -162,13 +188,47 @@ class NuHeatClient:
         payload = await self._request_json("GET", "/api/v2/Thermostat")
         if not isinstance(payload, list):
             raise NuHeatDataError("NuHeat thermostat response was not a list")
-        return [parse_thermostat(item) for item in payload]
+        thermostats = [parse_thermostat(item) for item in payload]
+        if not self._include_schedule_details or not any(
+            t.mode == MODE_MANUAL for t in thermostats
+        ):
+            return thermostats
+        thermostats = [
+            replace(t, schedule_details_requested=True) if t.mode == MODE_MANUAL else t
+            for t in thermostats
+        ]
+        try:
+            details = await self._request_json("GET", "/api/v1/Thermostat")
+            if not isinstance(details, list):
+                raise NuHeatDataError("NuHeat schedule details were not a list")
+            by_serial = {}
+            for detail in details:
+                data = _mapping(detail, "schedule details")
+                serial = _required_string(data, "serialNumber")
+                if serial in by_serial:
+                    raise NuHeatDataError("NuHeat returned duplicate schedule details")
+                by_serial[serial] = data
+            return [
+                with_schedule_details(t, by_serial.get(t.serial_number))
+                for t in thermostats
+            ]
+        except (NuHeatApiError, NuHeatDataError):
+            # Optional detail failures must not discard authoritative v2 data.
+            return thermostats
 
     async def get_thermostat(self, serial_number: str) -> Thermostat:
         """Return one thermostat by serial number."""
         serial = _serial_path(serial_number)
         payload = await self._request_json("GET", f"/api/v2/Thermostat/{serial}")
-        return parse_thermostat(payload)
+        thermostat = parse_thermostat(payload)
+        if self._include_schedule_details and thermostat.mode == MODE_MANUAL:
+            thermostat = replace(thermostat, schedule_details_requested=True)
+            try:
+                detail = await self._request_json("GET", f"/api/v1/Thermostat/{serial}")
+                return with_schedule_details(thermostat, detail)
+            except (NuHeatApiError, NuHeatDataError):
+                pass
+        return thermostat
 
     async def set_target_temperature(
         self,
@@ -216,13 +276,31 @@ class NuHeatClient:
         Auto resumes the schedule and is verified to exit Hold, Manual, and
         Standby. Hold with an explicit timezone-aware ``hold_until`` is timed;
         omitting it holds until the next scheduled event. The documented API
-        request for creating an indefinite hold remains unknown.
+        Permanent Hold uses the documented v1 thermostat update at schedule
+        mode 3; its explicit target prevents a reset to an unknown default.
 
-        Manual changes the physical thermostat operating mode, although its
-        mode-3/zero-target GET response is not distinguishable from every
-        Standby response using the documented fields alone.
+        Manual changes physical operating mode. Optional correlated v1 details
+        distinguish physical Manual from Auto with Permanent Hold.
         """
         schedule_mode = ScheduleMode(mode)
+        if schedule_mode is ScheduleMode.PERMANENT_HOLD:
+            if temperature is None:
+                raise ValueError("Permanent Hold requires an explicit temperature")
+            if hold_until is not None or temperature_type is not None:
+                raise ValueError(
+                    "Permanent Hold does not accept hold_until or temperature_type"
+                )
+            response = await self._request(
+                "PUT",
+                "/api/v1/Thermostat",
+                json={
+                    "serialNumber": _serial_value(serial_number),
+                    "setPointTemp": encode_temperature(temperature),
+                    "scheduleMode": 3,
+                },
+            )
+            response.release()
+            return await self.get_thermostat(serial_number)
         payload: dict[str, Any] = {"serialNumber": _serial_value(serial_number)}
         if schedule_mode is not ScheduleMode.AUTO:
             if temperature is not None:
@@ -335,6 +413,40 @@ def parse_thermostat(value: Any) -> Thermostat:
         hold_until_status=hold_until_status,
         error_state=_optional_string(data, "errorState"),
     )
+
+
+def with_schedule_details(thermostat: Thermostat, value: Any) -> Thermostat:
+    """Use correlated v1 fields only to disambiguate a complete v2 mode-3 read.
+
+    Neither endpoint is a snapshot transaction. Conflicting targets, modes,
+    serials, or expiration fields leave the original conservative state intact.
+    """
+    if thermostat.mode != MODE_MANUAL or not isinstance(value, dict):
+        return thermostat
+    try:
+        if _required_string(value, "serialNumber") != thermostat.serial_number:
+            return thermostat
+        operating = _required_int(value, "operatingMode")
+        schedule = _required_int(value, "scheduleMode")
+        raw_target = _optional_wire_temperature(value.get("setPointTemp"))
+        hold, _, status = _parse_hold_until(
+            {"holdUntil": value.get("holdSetPointDateTime")}
+        )
+        if (
+            operating not in (1, 2)
+            or schedule != 3
+            or "holdSetPointDateTime" not in value
+            or status is not HoldUntilStatus.NULL
+            or hold is not None
+            or thermostat.hold_until_status is not HoldUntilStatus.NULL
+            or thermostat.hold_until is not None
+            or not _is_valid_nonzero_wire_temperature(raw_target)
+            or raw_target != thermostat.raw_target_temperature
+        ):
+            return thermostat
+        return replace(thermostat, operating_mode=operating, schedule_mode=schedule)
+    except NuHeatDataError:
+        return thermostat
 
 
 def encode_temperature(value: float) -> int:
