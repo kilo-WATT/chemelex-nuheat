@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.1.2 (unreleased)
+## 0.1.3 - 2026-10-24
+
+- Separate permission denial from authentication expiry; optional v1 permission
+  failures preserve conservative v2 reads.
+- Honor Retry-After with runtime-client cooldown, without queued writes.
+- Bound requests and nested operations, propagate cancellation and retain accepted
+  PUT status on API readback failures. No new mode payloads or dependencies.
+
+## 0.1.2
 
 * Add an explicit, live-verified v1 Permanent Hold command with mandatory target.
 * Optionally correlate v1 operating/schedule details with mode-3 v2 responses,

@@ -17,6 +17,7 @@ from chemelex_nuheat import (
     NuHeatAuthError,
     NuHeatClient,
     NuHeatDataError,
+    NuHeatPermissionError,
     ScheduleMode,
     ThermostatState,
     decode_temperature,
@@ -308,7 +309,7 @@ async def test_write_accepts_successful_200_before_follow_up_get() -> None:
     ("status", "error"),
     [
         (400, NuHeatDataError),
-        (403, NuHeatAuthError),
+        (403, NuHeatPermissionError),
         (503, NuHeatApiError),
     ],
 )
@@ -333,7 +334,7 @@ async def test_401_forces_one_refresh_and_retries_once() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("statuses", [(401, 401), (403,)])
+@pytest.mark.parametrize("statuses", [(401, 401)])
 async def test_rejected_authorization(statuses: tuple[int, ...]) -> None:
     client, _, _ = make_client(*(FakeResponse(status) for status in statuses))
     with pytest.raises(NuHeatAuthError, match="authorization was rejected"):

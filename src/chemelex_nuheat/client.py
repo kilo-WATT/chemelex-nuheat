@@ -2,21 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
+from functools import wraps
 from http import HTTPStatus
-from typing import Any, Final
+from typing import Any, Concatenate, Final
 from urllib.parse import quote
 
-from aiohttp import ClientError, ClientResponse, ClientSession, ContentTypeError
+from aiohttp import ClientError, ClientSession, ClientTimeout, ContentTypeError
 
 API_BASE_URL: Final = "https://api.nam.mynuheat.com"
 # NuHeat's official app Standby is implemented as physical Manual at 41°F.
 STANDBY_TEMPERATURE_C: Final = 5.0
+REQUEST_TIMEOUT: Final = 15.0
+OPERATION_TIMEOUT: Final = 30.0
+RATE_LIMIT_FALLBACK: Final = 60.0
+_operation_state: ContextVar[tuple[NuHeatClient, list[bool]] | None] = ContextVar(
+    "nuheat_operation_state", default=None
+)
 
 
 class NuHeatApiError(RuntimeError):
@@ -32,10 +43,53 @@ class NuHeatApiError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
+        self.write_applied = False
 
 
 class NuHeatAuthError(RuntimeError):
     """NuHeat rejected the current authorization."""
+
+
+class NuHeatPermissionError(NuHeatApiError):
+    """The application lacks permission for the requested endpoint."""
+
+
+class NuHeatRateLimitError(NuHeatApiError):
+    """Requests are temporarily blocked by the runtime client's cooldown."""
+
+    def __init__(self, remaining: float, *, retry_after: str | None = None) -> None:
+        super().__init__(
+            "NuHeat request throttled; retry after the cooldown",
+            status=429,
+            retry_after=retry_after,
+        )
+        self.remaining = remaining
+
+
+def _bounded_operation[**P, T](
+    method: Callable[Concatenate[NuHeatClient, P], Awaitable[T]],
+) -> Callable[Concatenate[NuHeatClient, P], Awaitable[T]]:
+    """Bound nested calls and authorization without extending an outer budget."""
+
+    @wraps(method)
+    async def bounded(self: NuHeatClient, /, *args: P.args, **kwargs: P.kwargs) -> T:
+        state = _operation_state.get()
+        token = None
+        if state is None or state[0] is not self:
+            state = (self, [False])
+            token = _operation_state.set(state)
+        try:
+            async with asyncio.timeout(self._operation_timeout):
+                return await method(self, *args, **kwargs)
+        except TimeoutError as err:
+            failure = NuHeatApiError("NuHeat operation timed out")
+            failure.write_applied = state[1][0]
+            raise failure from err
+        finally:
+            if token is not None:
+                _operation_state.reset(token)
+
+    return bounded
 
 
 class NuHeatDataError(RuntimeError):
@@ -167,12 +221,50 @@ class NuHeatClient:
         *,
         base_url: str = API_BASE_URL,
         include_schedule_details: bool = False,
+        request_timeout: float = REQUEST_TIMEOUT,
+        operation_timeout: float = OPERATION_TIMEOUT,
     ) -> None:
         self._session = session
         self._access_token_provider = access_token_provider
         self._base_url = base_url.rstrip("/")
         self._include_schedule_details = include_schedule_details
+        if not all(
+            math.isfinite(v) and v > 0 for v in (request_timeout, operation_timeout)
+        ):
+            raise ValueError("Timeout budgets must be finite and positive")
+        self._request_timeout = request_timeout
+        self._operation_timeout = operation_timeout
+        self._cooldown_until = 0.0
 
+    @property
+    def cooldown_remaining(self) -> float:
+        """Remaining server cooldown, shared by this client's endpoints/devices."""
+        return max(0.0, self._cooldown_until - time.monotonic())
+
+    def raise_if_cooling_down(self) -> None:
+        """Reject new work without queuing requests or sleeping under locks."""
+        if remaining := self.cooldown_remaining:
+            raise NuHeatRateLimitError(remaining)
+
+    def _set_cooldown(self, header: str | None) -> None:
+        delay = RATE_LIMIT_FALLBACK
+        if header is not None:
+            try:
+                value = header.strip()
+                if value.isascii() and value.isdecimal():
+                    delay = float(value)
+                else:
+                    date = parsedate_to_datetime(value)
+                    if date.tzinfo is None:
+                        raise ValueError("Missing timezone")
+                    delay = max(0.0, date.timestamp() - time.time())
+                if not math.isfinite(delay):
+                    raise ValueError("Invalid duration")
+            except (ValueError, TypeError, OverflowError):
+                delay = RATE_LIMIT_FALLBACK
+        self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
+
+    @_bounded_operation
     async def get_account(self) -> Account:
         """Return account metadata exposed by OpenAPI v2."""
         payload = await self._request_json("GET", "/api/v2/Account")
@@ -183,6 +275,7 @@ class NuHeatClient:
             language=_optional_string(data, "language"),
         )
 
+    @_bounded_operation
     async def list_thermostats(self) -> list[Thermostat]:
         """Return all thermostats currently visible to the account."""
         payload = await self._request_json("GET", "/api/v2/Thermostat")
@@ -216,6 +309,7 @@ class NuHeatClient:
             # Optional detail failures must not discard authoritative v2 data.
             return thermostats
 
+    @_bounded_operation
     async def get_thermostat(self, serial_number: str) -> Thermostat:
         """Return one thermostat by serial number."""
         serial = _serial_path(serial_number)
@@ -230,6 +324,7 @@ class NuHeatClient:
                 pass
         return thermostat
 
+    @_bounded_operation
     async def set_target_temperature(
         self,
         serial_number: str,
@@ -250,6 +345,7 @@ class NuHeatClient:
             serial_number, mode, temperature=temperature, hold_until=hold_until
         )
 
+    @_bounded_operation
     async def set_standby(self, serial_number: str) -> Thermostat:
         """Command app Standby, implemented by the thermostat as Manual at 5°C.
 
@@ -262,6 +358,7 @@ class NuHeatClient:
             temperature=STANDBY_TEMPERATURE_C,
         )
 
+    @_bounded_operation
     async def set_schedule_mode(
         self,
         serial_number: str,
@@ -300,7 +397,7 @@ class NuHeatClient:
                 },
             )
             response.release()
-            return await self.get_thermostat(serial_number)
+            return await self._read_after_write(serial_number)
         payload: dict[str, Any] = {"serialNumber": _serial_value(serial_number)}
         if schedule_mode is not ScheduleMode.AUTO:
             if temperature is not None:
@@ -328,70 +425,88 @@ class NuHeatClient:
             "PUT", f"/api/v2/Mode/{schedule_mode.value.title()}", json=payload
         )
         response.release()
-        return await self.get_thermostat(serial_number)
+        return await self._read_after_write(serial_number)
+
+    async def _read_after_write(self, serial_number: str) -> Thermostat:
+        """Preserve certainty about an accepted PUT when readback fails."""
+        if (state := _operation_state.get()) is not None and state[0] is self:
+            state[1][0] = True
+        try:
+            return await self.get_thermostat(serial_number)
+        except NuHeatApiError as err:
+            err.write_applied = True
+            raise
 
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
-        response = await self._request(method, path, **kwargs)
-        try:
-            return await response.json()
-        except (ContentTypeError, ClientError, ValueError, TypeError) as err:
-            raise NuHeatDataError("NuHeat returned invalid JSON") from err
-        finally:
-            response.release()
+        return await self._request(method, path, read_json=True, **kwargs)
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> ClientResponse:
-        response: ClientResponse | None = None
+    async def _request(
+        self, method: str, path: str, *, read_json: bool = False, **kwargs: Any
+    ) -> Any:
         for attempt in range(2):
+            self.raise_if_cooling_down()
             try:
                 token = await self._access_token_provider(attempt == 1)
-                response = await self._session.request(
-                    method,
-                    f"{self._base_url}{path}",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/json",
-                    },
-                    **kwargs,
-                )
+                self.raise_if_cooling_down()
+                async with asyncio.timeout(self._request_timeout):
+                    response = await self._session.request(
+                        method,
+                        f"{self._base_url}{path}",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/json",
+                        },
+                        timeout=ClientTimeout(total=self._request_timeout),
+                        **kwargs,
+                    )
+                    try:
+                        status = response.status
+                        if status == HTTPStatus.UNAUTHORIZED:
+                            if attempt == 0:
+                                continue
+                            raise NuHeatAuthError("NuHeat authorization was rejected")
+                        if status == HTTPStatus.FORBIDDEN:
+                            raise NuHeatPermissionError(
+                                "NuHeat application permission denied", status=status
+                            )
+                        if status == HTTPStatus.TOO_MANY_REQUESTS:
+                            header = response.headers.get("Retry-After")
+                            self._set_cooldown(header)
+                            raise NuHeatRateLimitError(
+                                self.cooldown_remaining, retry_after=header
+                            )
+                        if status == HTTPStatus.NOT_IMPLEMENTED:
+                            raise NuHeatDataError(
+                                f"NuHeat API rejected the request with HTTP {status}"
+                            )
+                        if status >= 500:
+                            raise NuHeatApiError(
+                                f"NuHeat service temporarily failed with HTTP {status}",
+                                status=status,
+                            )
+                        if status >= HTTPStatus.BAD_REQUEST:
+                            raise NuHeatDataError(
+                                f"NuHeat API rejected the request with HTTP {status}"
+                            )
+                        if read_json:
+                            try:
+                                return await response.json()
+                            except (
+                                ContentTypeError,
+                                ClientError,
+                                ValueError,
+                                TypeError,
+                            ) as err:
+                                raise NuHeatDataError(
+                                    "NuHeat returned invalid JSON"
+                                ) from err
+                        return response
+                    finally:
+                        if read_json or response.status >= HTTPStatus.BAD_REQUEST:
+                            response.release()
             except (TimeoutError, ClientError) as err:
                 raise NuHeatApiError("Unable to communicate with NuHeat") from err
-
-            if response.status != HTTPStatus.UNAUTHORIZED:
-                break
-            response.release()
-
-        if response is None:  # pragma: no cover - defensive type narrowing
-            raise NuHeatApiError("NuHeat request did not return a response")
-        if response.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
-            response.release()
-            raise NuHeatAuthError("NuHeat authorization was rejected")
-        if response.status == HTTPStatus.TOO_MANY_REQUESTS:
-            status = response.status
-            retry_after = response.headers.get("Retry-After")
-            response.release()
-            raise NuHeatApiError(
-                f"NuHeat service temporarily failed with HTTP {status}",
-                status=status,
-                retry_after=retry_after,
-            )
-        if response.status == HTTPStatus.NOT_IMPLEMENTED:
-            response.release()
-            raise NuHeatDataError(
-                "NuHeat API rejected the request with HTTP "
-                f"{HTTPStatus.NOT_IMPLEMENTED}"
-            )
-        if response.status >= 500:
-            status = response.status
-            response.release()
-            raise NuHeatApiError(
-                f"NuHeat service temporarily failed with HTTP {status}",
-                status=status,
-            )
-        if response.status >= HTTPStatus.BAD_REQUEST:
-            status = response.status
-            response.release()
-            raise NuHeatDataError(f"NuHeat API rejected the request with HTTP {status}")
-        return response
+        raise NuHeatAuthError("NuHeat authorization was rejected")  # pragma: no cover
 
 
 def parse_thermostat(value: Any) -> Thermostat:

@@ -135,11 +135,36 @@ Report Home Assistant integration problems in
 this library's issue tracker. Library transport, model, and API parsing issues
 belong here.
 
+## API resilience (0.1.3)
+
+HTTP 403 now raises `NuHeatPermissionError`, a `NuHeatApiError` subclass; it no
+longer represents an expired login. Optional v1-detail 403 retains conservative
+v2 data. Persistent 401 still forces one token refresh/retry and then raises
+`NuHeatAuthError`. Do not infer Permanent Hold from unavailable v1 permissions.
+
+HTTP 429 raises `NuHeatRateLimitError` with remaining cooldown and the original
+Retry-After header. Delta-seconds and HTTP dates are accepted; unusable headers
+use 60 seconds. `cooldown_remaining` and `raise_if_cooling_down()` expose the
+same monotonic deadline for every endpoint/device on that client. New requests
+fail without waiting; optional-detail fallback retains the cooldown. Separate
+processes/client instances do not share this state. Writes are never queued.
+
+Requests have a 15-second header/body budget and public operations have a
+30-second total budget including token waits and nested readbacks. Constructor
+`request_timeout` and `operation_timeout` allow finite positive budgets for
+isolated testing. HA's shared session configuration is not changed. Cancellation
+propagates and responses are released. A successful PUT followed by an API-error
+readback sets the exception's `write_applied` flag; its write must not be repeated
+automatically. The existing single retry after an explicit 401 is unchanged.
+
+These contracts are introduced in 0.1.3.
+No new mode payloads, registration values, or hardware validation are included.
+
 ## License
 
 Apache License 2.0.
 
-## Unreleased 0.1.2 Permanent Hold extension
+## Permanent Hold extension (0.1.2)
 
 `NuHeatClient(..., include_schedule_details=True)` supplements mode-3 reads with
 correlated v1 operating/schedule fields. Matching Auto/schedule-mode-3 responses
@@ -151,6 +176,5 @@ metadata retains the conservative v2 state, never a guessed Permanent Hold.
 the documented minimal v1 thermostat update. Temperature is mandatory; expiration
 and temperatureType are rejected. `set_target_temperature` accepts the same mode.
 The command was verified from Manual and scheduled Auto in an approved isolated
-hardware comparison, with the original state restored. This version is not yet
-published. Older notes about an unknown indefinite-hold request describe v2-only
+hardware comparison, with the original state restored. Older notes about an unknown indefinite-hold request describe v2-only
 behavior and are superseded by this explicit v1 command.
