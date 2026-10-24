@@ -186,7 +186,7 @@ async def test_optional_detail_failure_preserves_v2_data(response):
 
 
 async def test_optional_auth_error_still_requires_reauth():
-    session = FakeSession(FakeResponse(200, [V2]), FakeResponse(403))
+    session = FakeSession(FakeResponse(200, [V2]), FakeResponse(401), FakeResponse(401))
     client = NuHeatClient(session, token, include_schedule_details=True)
     with pytest.raises(NuHeatAuthError):
         await client.list_thermostats()
