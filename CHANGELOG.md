@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 - 2026-10-27
+
+- Expose account-subject extraction and a typed invalid-identity error for OAuth
+  integrations. Payload decoding does not authenticate the token, and errors
+  omit token contents.
+
 ## 0.1.3 - 2026-10-24
 
 - Separate permission denial from authentication expiry; optional v1 permission
