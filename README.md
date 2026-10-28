@@ -57,6 +57,14 @@ async with aiohttp.ClientSession() as session:
     await client.set_standby(thermostat.serial_number)
 ```
 
+## Account identity
+
+`account_subject_from_access_token(access_token)` returns the non-empty OAuth
+`sub` claim, or raises `InvalidAccountSubjectError` with a generic message.
+It only decodes the payload: it does not verify a signature, issuer, audience,
+or expiry. Obtain the token through a trusted OAuth flow and validate API access
+before relying on its subject. Do not log the token or account identifier.
+
 ## Supported operations
 
 - Retrieve account information.

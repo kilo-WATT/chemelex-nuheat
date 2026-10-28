@@ -20,12 +20,14 @@ from .client import (
     encode_temperature,
     parse_thermostat,
 )
+from .identity import InvalidAccountSubjectError, account_subject_from_access_token
 
 __all__ = [
     "API_BASE_URL",
     "AccessTokenProvider",
     "Account",
     "HoldUntilStatus",
+    "InvalidAccountSubjectError",
     "NuHeatApiError",
     "NuHeatAuthError",
     "NuHeatClient",
@@ -36,6 +38,7 @@ __all__ = [
     "STANDBY_TEMPERATURE_C",
     "Thermostat",
     "ThermostatState",
+    "account_subject_from_access_token",
     "classify_thermostat_state",
     "decode_temperature",
     "encode_temperature",
