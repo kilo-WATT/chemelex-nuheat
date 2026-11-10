@@ -98,7 +98,13 @@ def make_client(
         refreshes.append(force_refresh)
         return next(token_values)
 
-    return NuHeatClient(session, access_token), session, refreshes  # type: ignore[arg-type]
+    return (
+        NuHeatClient(
+            session, access_token, utcnow=lambda: datetime(2026, 1, 1, tzinfo=UTC)
+        ),
+        session,
+        refreshes,
+    )  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -269,10 +275,10 @@ async def test_documented_writes_accept_empty_204_and_refresh_with_get(
 
 
 @pytest.mark.asyncio
-async def test_temperature_type_is_rejected_until_enum_meanings_are_verified() -> None:
+async def test_temperature_type_remains_rejected_until_implemented() -> None:
     client, session, _ = make_client()
 
-    with pytest.raises(ValueError, match="enum meanings are unverified"):
+    with pytest.raises(ValueError, match="control is not implemented"):
         await client.set_schedule_mode(
             "ABC123", ScheduleMode.MANUAL, temperature=22.0, temperature_type=1
         )

@@ -1,5 +1,45 @@
 # chemelex-nuheat
 
+## Release 0.1.5
+
+This release adds explicit timed-hold expiry validation and an optional push
+listener. Existing consumers can continue using their exact dependency pins.
+
+`normalize_hold_until` drops fractional seconds after converting an aware expiry
+to UTC. `validate_hold_until(value, now=...)` additionally requires two seconds
+of local lead time, with no upper duration cap. The client repeats that check
+after authorization, immediately before every actual timed request, including
+the single retry allowed after definite HTTP 401. A server-receipt 400 is still
+possible because of network delay/clock differences; expiry is never advanced.
+Resend the explicit expiry on every timed retarget. A 401 on post-write GET
+retries only that GET; uncertain PUTs, timeouts/5xx and failed readback do not
+replay writes. `NuHeatHoldTimeError` means local validation prevented submission.
+
+`client.create_notifications(known_devices, invalidate)` constructs an inactive
+account listener. `known_devices` returns known device IDs in memory; `invalidate`
+is a synchronous callback that schedules a coalesced REST read. Call `start()`
+only when explicitly enabled, then always `await close()` during unload. The
+adapter reuses the supplied session's connector, but owns a separate cookie-free
+session with redirects blocked. Closing it does not close the caller's session.
+
+The adapter implements the limited SignalR JSON v1 contract, not a general hub
+client: direct WebSocket at `/v2/notificationsHost`, bearer header only, bounded
+record-separated handshake/Subscribe, thermostat Notify timestamp deduplication,
+application Ping and Close. It resubscribes and invalidates once on reconnect.
+Opening budget: 30 seconds; server silence: 45 seconds; Ping: 15 seconds;
+reconnect: 5â€“300 seconds with jitter and shared cooldown. Preserve independent
+REST polling and never treat a notification as command confirmation. Do not log
+raw frames, token-bearing errors, identifiers or event timestamps.
+
+Synthetic coverage is supplemented by a separately approved isolated read-only
+live check of hub subscription, ordinary reconnect, push-triggered authoritative
+refresh and five-minute polling fallback for one account/device. Long-lived token
+expiry and broader account/device coverage remain unverified. No energy models or relative controls are
+implemented by these stages. See the beta's OpenSpec change for the approved
+scope; production use and publication are not authorized by local validation.
+
+## Existing public client
+
 `chemelex-nuheat` is a community-maintained, typed asynchronous Python client
 for the North American Chemelex/NuHeat API v2. It is not an official Chemelex
 product and is not affiliated with or endorsed by Chemelex.
@@ -80,14 +120,14 @@ NuHeat API's centi-Celsius integers are encoded and decoded at the HTTP
 boundary. A zero or missing read value is exposed as `None`; live responses use
 zero as an unavailable setpoint sentinel. Account Fahrenheit preference does
 not change this wire decoding. Outbound values use decimal half-up rounding;
-for example, 45°F converted by a caller to approximately 7.2222°C is sent as
+for example, 45Â°F converted by a caller to approximately 7.2222Â°C is sent as
 the integer `722`.
 
 `Thermostat.state` conservatively derives scheduled operation, timed hold,
 Standby, ambiguous Manual-or-permanent-hold, or unknown from the numeric mode,
 raw setpoint, and hold end together. Controlled live validation after the
 vendor's September 2026 GET fix established mode 1 as Auto, mode 2 as Hold,
-and mode 3 as the Manual-family response. Mode 3 with a 5°C target is the
+and mode 3 as the Manual-family response. Mode 3 with a 5Â°C target is the
 official app's Standby state. Other mode-3 targets remain ambiguous between
 physical Manual and an indefinite hold in v2. The client preserves all raw
 fields so callers can handle future vendor clarifications without losing
@@ -97,9 +137,9 @@ Live write validation established these command semantics:
 
 - Auto resumes the schedule and exits a hold, physical Manual mode, or Standby.
   A GET response can remain identical before and after exiting Standby.
-- Standby uses the documented Manual command at 5°C/41°F. The official app
+- Standby uses the documented Manual command at 5Â°C/41Â°F. The official app
   labels this state Standby while the physical thermostat reports Manual at
-  41°F. It is a frost-protected standby state, not a hard power disconnect.
+  41Â°F. It is a frost-protected standby state, not a hard power disconnect.
 - Hold with an explicit timezone-aware end creates a timed hold. The client
   serializes the end in UTC and preserves seconds; the service may normalize
   returned seconds to the minute.
@@ -111,15 +151,16 @@ Live write validation established these command semantics:
   the v2 read model, so that state remains deliberately ambiguous.
 
 Standby is both writable and readable: mode 3 with raw target `500` represents
-5°C/41°F Standby. Auto at the same 41°F target remains distinguishable because
+5Â°C/41Â°F Standby. Auto at the same 41Â°F target remains distinguishable because
 it reports mode 1.
 
 The optional 0.1.2 extension creates indefinite hold using the documented v1
 thermostat command; v2 has no separate Permanent Hold command endpoint.
 Successful mode writes return an empty HTTP 204; the client does not decode
 that body and follows it with a GET.
-The `temperatureType` enum meanings remain unverified, so the client omits the
-field and rejects attempts to set it.
+Chemelex confirms Absolute=0 and Relative=1, with Relative based on measured room
+temperature. Relative control is not implemented in this client: it still omits
+the field and rejects attempts to set it, preserving existing absolute calls.
 
 `NuHeatAuthError` indicates rejected authorization. `NuHeatApiError` indicates
 a transport, rate-limit, or server failure that may be retryable.

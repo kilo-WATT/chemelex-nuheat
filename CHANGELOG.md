@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+- Validate explicit UTC hold expiry immediately before submission, including a definite HTTP 401 retry.
+- Add an optional SignalR notification listener for callers that retain REST polling.
+- Preserve exact expiry verification. On the tested Signature setup, readback truncated seconds and shortened a 25-hour request to about 23 hours.
+
 ## 0.1.4 - 2026-10-27
 
 - Expose account-subject extraction and a typed invalid-identity error for OAuth

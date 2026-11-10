@@ -14,10 +14,13 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from functools import wraps
 from http import HTTPStatus
-from typing import Any, Concatenate, Final
+from typing import TYPE_CHECKING, Any, Concatenate, Final
 from urllib.parse import quote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, ContentTypeError
+
+if TYPE_CHECKING:
+    from .notifications import NuHeatNotifications
 
 API_BASE_URL: Final = "https://api.nam.mynuheat.com"
 # NuHeat's official app Standby is implemented as physical Manual at 41°F.
@@ -94,6 +97,10 @@ def _bounded_operation[**P, T](
 
 class NuHeatDataError(RuntimeError):
     """NuHeat returned a response that does not match the documented schema."""
+
+
+class NuHeatHoldTimeError(ValueError):
+    """An explicit expiry cannot safely be submitted; no request was sent."""
 
 
 class ScheduleMode(StrEnum):
@@ -223,6 +230,7 @@ class NuHeatClient:
         include_schedule_details: bool = False,
         request_timeout: float = REQUEST_TIMEOUT,
         operation_timeout: float = OPERATION_TIMEOUT,
+        utcnow: Callable[[], datetime] | None = None,
     ) -> None:
         self._session = session
         self._access_token_provider = access_token_provider
@@ -235,6 +243,7 @@ class NuHeatClient:
         self._request_timeout = request_timeout
         self._operation_timeout = operation_timeout
         self._cooldown_until = 0.0
+        self._utcnow = utcnow or (lambda: datetime.now(UTC))
 
     @property
     def cooldown_remaining(self) -> float:
@@ -245,6 +254,22 @@ class NuHeatClient:
         """Reject new work without queuing requests or sleeping under locks."""
         if remaining := self.cooldown_remaining:
             raise NuHeatRateLimitError(remaining)
+
+    def create_notifications(
+        self, known_devices: Callable[[], set[str]], invalidate: Callable[[], None]
+    ) -> NuHeatNotifications:
+        """Create an optional inactive listener sharing account auth and quota."""
+        from .notifications import NuHeatNotifications
+
+        return NuHeatNotifications(
+            self._session,
+            self._access_token_provider,
+            known_devices,
+            invalidate,
+            base_url=self._base_url,
+            cooldown_remaining=lambda: self.cooldown_remaining,
+            set_cooldown=self._set_cooldown,
+        )
 
     def _set_cooldown(self, header: str | None) -> None:
         delay = RATE_LIMIT_FALLBACK
@@ -404,8 +429,8 @@ class NuHeatClient:
                 payload["temperature"] = encode_temperature(temperature)
             if temperature_type is not None:
                 raise ValueError(
-                    "temperature_type is not supported because its enum meanings "
-                    "are unverified"
+                    "temperature_type is not supported; measured-room-relative "
+                    "control is not implemented"
                 )
         if (
             hold_until is not None
@@ -418,11 +443,13 @@ class NuHeatClient:
         ):
             if hold_until.tzinfo is None:
                 raise ValueError("hold_until must be timezone-aware")
-            payload["holdUntil"] = (
-                hold_until.astimezone(UTC).isoformat().replace("+00:00", "Z")
-            )
+            hold_until = normalize_hold_until(hold_until)
+            payload["holdUntil"] = hold_until.isoformat().replace("+00:00", "Z")
         response = await self._request(
-            "PUT", f"/api/v2/Mode/{schedule_mode.value.title()}", json=payload
+            "PUT",
+            f"/api/v2/Mode/{schedule_mode.value.title()}",
+            json=payload,
+            hold_until=hold_until,
         )
         response.release()
         return await self._read_after_write(serial_number)
@@ -441,13 +468,21 @@ class NuHeatClient:
         return await self._request(method, path, read_json=True, **kwargs)
 
     async def _request(
-        self, method: str, path: str, *, read_json: bool = False, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        read_json: bool = False,
+        hold_until: datetime | None = None,
+        **kwargs: Any,
     ) -> Any:
         for attempt in range(2):
             self.raise_if_cooling_down()
             try:
                 token = await self._access_token_provider(attempt == 1)
                 self.raise_if_cooling_down()
+                if hold_until is not None:
+                    validate_hold_until(hold_until, now=self._utcnow())
                 async with asyncio.timeout(self._request_timeout):
                     response = await self._session.request(
                         method,
@@ -709,6 +744,23 @@ def _parse_hold_until(
     if parsed.tzinfo is None:
         return None, value, HoldUntilStatus.INVALID
     return parsed, value, HoldUntilStatus.VALUE
+
+
+def normalize_hold_until(value: datetime) -> datetime:
+    """Match the API's UTC, whole-second expiry without moving it forward."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise NuHeatHoldTimeError("hold_until must be timezone-aware")
+    return value.astimezone(UTC).replace(microsecond=0)
+
+
+def validate_hold_until(value: datetime, *, now: datetime) -> datetime:
+    """Require the vendor's two-second lead locally; server receipt may differ."""
+    value = normalize_hold_until(value)
+    if (value - now).total_seconds() < 2:
+        raise NuHeatHoldTimeError(
+            "hold_until must be at least two seconds in the future"
+        )
+    return value
 
 
 def _serial_value(value: str) -> str:

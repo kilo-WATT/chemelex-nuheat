@@ -10,6 +10,7 @@ from .client import (
     NuHeatAuthError,
     NuHeatClient,
     NuHeatDataError,
+    NuHeatHoldTimeError,
     NuHeatPermissionError,
     NuHeatRateLimitError,
     ScheduleMode,
@@ -18,7 +19,9 @@ from .client import (
     classify_thermostat_state,
     decode_temperature,
     encode_temperature,
+    normalize_hold_until,
     parse_thermostat,
+    validate_hold_until,
 )
 from .identity import InvalidAccountSubjectError, account_subject_from_access_token
 
@@ -32,6 +35,7 @@ __all__ = [
     "NuHeatAuthError",
     "NuHeatClient",
     "NuHeatDataError",
+    "NuHeatHoldTimeError",
     "NuHeatPermissionError",
     "NuHeatRateLimitError",
     "ScheduleMode",
@@ -43,4 +47,6 @@ __all__ = [
     "decode_temperature",
     "encode_temperature",
     "parse_thermostat",
+    "normalize_hold_until",
+    "validate_hold_until",
 ]
